@@ -2,6 +2,7 @@
 # 小雅同步元数据
 
 高速异步爬虫从 https://emby.xiaoya.pro/ 同步小雅元数据
+该版本修改了fetch_html、download函数，generate_localdb函数添加windows系统判断，exam_file函数添加了.replace('\\', '/')
 
 ---
 
@@ -24,20 +25,20 @@ ulimit -n 4096
   git clone https://github.com/Rik-F5/xiaoya_db
 ```
 
-#### Go to the project directory
+#### 跳转到项目文件夹
 
 ```bash
   cd xiaoya_db
 ```
 
-#### Switch to venv
+#### 选择环境
 
 ```bash
   python3 -m venv .venv
   source .venv/bin/activate
 ```
 
-#### Install modules
+#### 安装依赖
 
 ```bash
   python -m pip install -r requirements.txt
@@ -50,7 +51,7 @@ python solid.py --media <Xiaoya Folder>
 
 ```
 ---
-## Usage/Examples
+## 调用示例
 
 Download the metadata without replace the local NFOs
 ```bash
