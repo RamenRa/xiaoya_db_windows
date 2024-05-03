@@ -98,16 +98,18 @@ async def fetch_html(url, session, **kwargs) -> str:
     async def _fetch_with_retry(session, url, retries_left):
         try:
             resp = await session.request(method="GET", url=url)
-            resp.raise_for_status()  # 抛出异常
+            resp.raise_for_status()  # 这会抛出异常，如果状态码是 4xx 或 5xx
             return await resp.text()
         except aiohttp.ClientError as e:
             if retries_left > 0:
-                await asyncio.sleep(delay)
+                # 等待一段时间后再重试，避免立即重试导致的服务器压力
+                await asyncio.sleep(delay)  # 例如，等待1秒
                 return await _fetch_with_retry(session, url, retries_left - 1)
             else:
+                # 所有重试都失败了，记录错误并返回
                 logger.error("Failed to fetch HTML for URL: %s after %d retries, Error: %s",
                              unquote(url), retries, e)
-                return "" 
+                return ""  # 或者抛出异常，或者返回一个错误消息
 
     async with semaphore:
         html = await _fetch_with_retry(session, url, retries)
@@ -188,8 +190,10 @@ async def download(file, session, **kwargs):
             try:
                 response = await session.get(url)
                 if response.status == 200:
-                    file_path = os.path.join(kwargs['media'].replace('\\', '/'), filename.lstrip('/'))
-                    modified_path = file_path.replace('\\', '/').replace('|', '%7c')
+                    file_path = os.path.join(kwargs['media'], filename.lstrip('/'))
+                    modified_path = file_path.replace('\\', '/')
+                    if os.name == 'nt':
+                        modified_path = modified_path.replace('|', '%7c')
                     os.umask(0)
                     os.makedirs(os.path.dirname(modified_path), mode=0o777, exist_ok=True)
                     async with aiofiles.open(modified_path, 'wb') as f:
@@ -198,14 +202,15 @@ async def download(file, session, **kwargs):
                         logger.debug("Finish to write file: %s", filename)
                     os.chmod(modified_path, 0o777)
                     logger.info("Downloaded: %s", filename)
-                    return 
+                    return  # 成功下载后退出重试循环
                 else:
                     logger.info("Failed to download: %s [Response code: %s]", filename, response.status)
             except aiohttp.ClientError as e:
                 # re_download += 1
                 logger.warning("Download failed with exception: %s. Retrying...", e)
-                await asyncio.sleep(delay) 
+                await asyncio.sleep(delay)  # 等待一段时间后再重试
 
+        # 如果重试完所有次数后仍然失败，则打印最终错误信息
         logger.error("Failed to download after %d retries: %s", 3, filename)
         # download_error_list.append(filename)
 
@@ -252,7 +257,7 @@ async def generate_localdb(db, media):
         await create_table(conn)
         for path in s_paths:
             logger.info("Processing %s", unquote(os.path.join(media, path)))
-            await process_folder(conn, unquote(os.path.join(media, path)), media)
+            await process_folder(conn, unquote(os.path.join(media, path)), media)   # 扫描本地文件
         if os.name != 'nt':  # 不加这个windows上 第一次生成.localfiles.db 运行会报错
             await conn.close()
 
@@ -280,7 +285,7 @@ async def write_one(url, session, db_session, **kwargs) -> list:
     return directories
 
 
-async def bulk_crawl_and_write(url, session, db_session, **kwargs) -> None: 
+async def bulk_crawl_and_write(url, session, db_session, **kwargs) -> None:  # 临时db
     tasks = []
     directories = await write_one(url=url, session=session, db_session=db_session, **kwargs)
     for url in directories:
