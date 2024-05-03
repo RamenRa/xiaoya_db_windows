@@ -190,8 +190,10 @@ async def download(file, session, **kwargs):
             try:
                 response = await session.get(url)
                 if response.status == 200:
-                    file_path = os.path.join(kwargs['media'].replace('\\', '/'), filename.lstrip('/'))
-                    modified_path = file_path.replace('\\', '/').replace('|', '%7c')
+                    file_path = os.path.join(kwargs['media'], filename.lstrip('/'))
+                    modified_path = file_path.replace('\\', '/')
+                    if os.name == 'nt':
+                        modified_path = modified_path.replace('|', '%7c')
                     os.umask(0)
                     os.makedirs(os.path.dirname(modified_path), mode=0o777, exist_ok=True)
                     async with aiofiles.open(modified_path, 'wb') as f:
