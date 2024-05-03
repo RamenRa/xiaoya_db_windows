@@ -8,12 +8,14 @@ from urllib.parse import urljoin, urlparse, unquote, quote
 from bs4 import BeautifulSoup
 from datetime import datetime
 import random
+import re
 
 import asyncio
 import aiofiles
 import aiohttp
 from aiohttp import ClientSession, TCPConnector
 import aiosqlite
+import aiofiles.os as aio_os
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s:%(name)s: %(message)s",
@@ -23,7 +25,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("areq")
 logging.getLogger("chardet.charsetprober").disabled = True
-
 
 s_paths = [
     quote('每日更新/'),
@@ -36,6 +37,12 @@ s_pool = [
     "https://emby.xiaoya.pro/",
     "http://icyou.eu.org/",
     "https://lanyuewan.cn/"
+]
+
+s_ext = [
+    ".ass",
+    ".srt",
+    ".ssa"
 ]
 
 # CF blocks urllib...
@@ -61,16 +68,53 @@ def pick_a_pool_member(url_list):
     return None
 
 
+def current_amount(url):
+    try:
+        with urllib.request.urlopen(url) as response:
+            pattern = r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2} \/(.*)$'
+            hidden_pattern = r'^.*?\/\..*$'
+            matching_lines = 0
+            for line in response:
+                line = line.decode().strip()
+                match = re.match(pattern, line)
+                if match:
+                    file = match.group(1)
+                    if any(file.startswith(unquote(path)) for path in s_paths):
+                        if not re.match(hidden_pattern, file):
+                            matching_lines += 1
+            return matching_lines
+    except urllib.error.URLError as e:
+        print("Error:", e)
+        return -1
+
+
 async def fetch_html(url, session, **kwargs) -> str:
-    semaphore = kwargs['semaphore']
+    retries = kwargs.get('retries', 3)  # 允许通过kwargs传递retries参数
+    delay = kwargs.get('delay', 10)  # 允许通过kwargs传递delay参数
+    semaphore = kwargs.get('semaphore')
+    if semaphore is None:
+        raise ValueError("Semaphore is required")
+
+    async def _fetch_with_retry(session, url, retries_left):
+        try:
+            resp = await session.request(method="GET", url=url)
+            resp.raise_for_status()  # 这会抛出异常，如果状态码是 4xx 或 5xx
+            return await resp.text()
+        except aiohttp.ClientError as e:
+            if retries_left > 0:
+                # 等待一段时间后再重试，避免立即重试导致的服务器压力
+                await asyncio.sleep(delay)  # 例如，等待1秒
+                return await _fetch_with_retry(session, url, retries_left - 1)
+            else:
+                # 所有重试都失败了，记录错误并返回
+                logger.error("Failed to fetch HTML for URL: %s after %d retries, Error: %s",
+                             unquote(url), retries, e)
+                return ""  # 或者抛出异常，或者返回一个错误消息
+
     async with semaphore:
-        resp = await session.request(method="GET", url=url)
-        logger.debug("Request Headers for [%s]: [%s]", unquote(url), resp.request_info.headers)
-        resp.raise_for_status()       
-        logger.debug("Response Headers for [%s]: [%s]", unquote(url), resp.headers)
-        logger.debug("Got response [%s] for URL: %s", resp.status, unquote(url))
-        html = await resp.text()
+        html = await _fetch_with_retry(session, url, retries)
         return html
+
 
 async def parse(url, session, **kwargs) -> set:
     files = []
@@ -113,12 +157,13 @@ async def parse(url, session, **kwargs) -> set:
                 directories.append(urljoin(url, href))
         return files, directories
 
+
 async def need_download(file, **kwargs):
     url, filename, timestamp, filesize = file
     file_path = os.path.join(kwargs['media'], filename.lstrip('/'))
     if not os.path.exists(file_path):
         logger.debug("%s doesn't exists", file_path)
-        return True 
+        return True
     elif file_path.endswith('.nfo'):
         if not kwargs['nfo']:
             return False
@@ -134,23 +179,38 @@ async def need_download(file, **kwargs):
     logger.debug("%s has current_timestamp: %s and current_size: %s", filename, current_timestamp, current_filesize)
     return True
 
+
 async def download(file, session, **kwargs):
     url, filename, timestamp, filesize = file
     semaphore = kwargs['semaphore']
+    retries = kwargs.get('retries', 3)  # 允许通过kwargs传递retries参数
+    delay = kwargs.get('delay', 5)  # 允许通过kwargs传递delay参数
     async with semaphore:
-        response = await session.get(url)
-        if response.status == 200:
-            file_path = os.path.join(kwargs['media'], filename.lstrip('/'))
-            os.umask(0)
-            os.makedirs(os.path.dirname(file_path), mode=0o777, exist_ok=True)
-            async with aiofiles.open(file_path, 'wb') as f:
-                logger.debug("Starting to write file: %s", filename)
-                await f.write(await response.content.read())
-                logger.debug("Finish to write file: %s", filename)
-            os.chmod(file_path, 0o777)
-            logger.info("Downloaded: %s", filename)
-        else:
-            logger.info("Failed to download: %s [Response code: %s]", filename, response.status)
+        for retry in range(retries):
+            try:
+                response = await session.get(url)
+                if response.status == 200:
+                    file_path = os.path.join(kwargs['media'].replace('\\', '/'), filename.lstrip('/'))
+                    modified_path = file_path.replace('\\', '/').replace('|', '%7c')
+                    os.umask(0)
+                    os.makedirs(os.path.dirname(modified_path), mode=0o777, exist_ok=True)
+                    async with aiofiles.open(modified_path, 'wb') as f:
+                        logger.debug("Starting to write file: %s", filename)
+                        await f.write(await response.content.read())
+                        logger.debug("Finish to write file: %s", filename)
+                    os.chmod(modified_path, 0o777)
+                    logger.info("Downloaded: %s", filename)
+                    return  # 成功下载后退出重试循环
+                else:
+                    logger.info("Failed to download: %s [Response code: %s]", filename, response.status)
+            except aiohttp.ClientError as e:
+                # re_download += 1
+                logger.warning("Download failed with exception: %s. Retrying...", e)
+                await asyncio.sleep(delay)  # 等待一段时间后再重试
+
+        # 如果重试完所有次数后仍然失败，则打印最终错误信息
+        logger.error("Failed to download after %d retries: %s", 3, filename)
+        # download_error_list.append(filename)
 
 
 async def download_files(files, session, **kwargs):
@@ -161,7 +221,43 @@ async def download_files(files, session, **kwargs):
             download_tasks.append(task)
     await asyncio.gather(*download_tasks)
 
-    
+
+async def create_table(conn):
+    async with conn.execute('''
+        CREATE TABLE IF NOT EXISTS files (
+            filename TEXT,
+            timestamp INTEGER,
+            filesize INTEGER)
+    '''):
+        pass
+
+
+async def insert_files(conn, items):
+    await conn.executemany('INSERT OR REPLACE INTO files VALUES (?, ?, ?)', items)
+    await conn.commit()
+
+
+async def exam_file(file, media):
+    stat = await aio_os.stat(file)
+    return file[len(media):].replace('\\', '/'), int(stat.st_mtime), stat.st_size
+
+async def process_folder(conn, folder, media):
+    for root, _, files in os.walk(folder):
+        for file in files:
+            items = []
+            if not file.startswith('.') and not file.lower().endswith(tuple(s_ext)):
+                items.append(await exam_file(os.path.join(root, file), media))
+                await insert_files(conn, items)
+
+
+async def generate_localdb(db, media):
+    async with aiosqlite.connect(db) as conn:
+        await create_table(conn)
+        for path in s_paths:
+            logger.info("Processing %s", unquote(os.path.join(media, path)))
+            await process_folder(conn, unquote(os.path.join(media, path)), media)   # 扫描本地文件
+        if os.name != 'nt':  # 不加这个windows上 第一次生成.localfiles.db 运行会报错
+            await conn.close()
 
 
 async def write_one(url, session, db_session, **kwargs) -> list:
@@ -174,16 +270,20 @@ async def write_one(url, session, db_session, **kwargs) -> list:
     files, directories = await parse(url=url, session=session, **kwargs)
     if not files:
         return directories
-    if db_session:
-        await db_session.executemany('INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?)', files)
-        await db_session.commit()
-        logger.debug("Wrote results for source URL: %s", unquote(url))
     if kwargs['media']:
         await download_files(files=files, session=session, **kwargs)
+    if db_session:
+        items = []
+        for file in files:
+            items.append(file[1:])
+        # await db_session.executemany('INSERT OR REPLACE INTO files VALUES (?, ?, ?)', items)
+        # await db_session.commit()
+        await insert_files(db_session, items)
+        logger.debug("Wrote results for source URL: %s", unquote(url))
     return directories
 
 
-async def bulk_crawl_and_write(url, session, db_session, **kwargs) -> None:
+async def bulk_crawl_and_write(url, session, db_session, **kwargs) -> None:  # 临时db
     tasks = []
     directories = await write_one(url=url, session=session, db_session=db_session, **kwargs)
     for url in directories:
@@ -192,39 +292,88 @@ async def bulk_crawl_and_write(url, session, db_session, **kwargs) -> None:
     await asyncio.gather(*tasks)
 
 
-async def main() :
+async def compare_databases(localdb, tempdb, total_amount):
+    async with aiosqlite.connect(localdb) as conn1, aiosqlite.connect(tempdb) as conn2:
+        cursor1 = await conn1.cursor()
+        cursor2 = await conn2.cursor()
+
+        await cursor1.execute("SELECT filename FROM files")
+        local_filenames = set(filename[0] for filename in await cursor1.fetchall())
+
+        await cursor2.execute("SELECT filename FROM files")
+        temp_filenames = set(filename[0] for filename in await cursor2.fetchall())
+        gap = abs(len(temp_filenames) - total_amount)
+
+        if gap < 10:
+            if not gap == 0:
+                logger.warning("Total amount do not match: %d -> %d. But the gap %d is less than 10, purging anyway...",
+                               total_amount, len(temp_filenames), abs(len(temp_filenames) - total_amount))
+            diff_filenames = local_filenames - temp_filenames
+            return diff_filenames
+        else:
+            logger.error("Total amount do not match: %d -> %d. Purges are skipped", total_amount, len(temp_filenames))
+            return []
+
+
+async def purge_removed_files(localdb, tempdb, media, total_amount):
+    for file in await compare_databases(localdb, tempdb, total_amount):
+        logger.info("Purged %s", file)
+        os.remove(media + file)
+
+
+async def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--media", metavar="<folder>", type=str, default=None, help="Path to store downloaded media files [Default: %(default)s]")
-    parser.add_argument("--count", metavar="[number]", type=int, default=100, help="Max concurrent HTTP Requests [Default: %(default)s]")
-    parser.add_argument("--debug", action=argparse.BooleanOptionalAction, type=bool, default=False, help="Verbose debug [Default: %(default)s]")
-    parser.add_argument("--db", action=argparse.BooleanOptionalAction, type=bool, default=False, help="<Python3.12+ required> Save into DB [Default: %(default)s]")
-    parser.add_argument("--nfo", action=argparse.BooleanOptionalAction, type=bool, default=False, help="Download NFO [Default: %(default)s]")
+    parser.add_argument("--media", metavar="<folder>", type=str, default=None,
+                        help="Path to store downloaded media files [Default: %(default)s]")
+    parser.add_argument("--count", metavar="[number]", type=int, default=100,
+                        help="Max concurrent HTTP Requests [Default: %(default)s]")
+    parser.add_argument("--debug", action=argparse.BooleanOptionalAction, type=bool, default=False,
+                        help="Verbose debug [Default: %(default)s]")
+    parser.add_argument("--db", action=argparse.BooleanOptionalAction, type=bool, default=False,
+                        help="<Python3.12+ required> Save into DB [Default: %(default)s]")
+    parser.add_argument("--nfo", action=argparse.BooleanOptionalAction, type=bool, default=False,
+                        help="Download NFO [Default: %(default)s]")
     parser.add_argument("--url", metavar="[url]", type=str, default=None, help="Download path [Default: %(default)s]")
-    
+    parser.add_argument("--purge", action=argparse.BooleanOptionalAction, type=bool, default=True,
+                        help="Purge removed files [Default: %(default)s]")
+
     args = parser.parse_args()
+    media = args.media.rstrip('/')
     if args.debug == True:
         logging.getLogger("areq").setLevel(logging.DEBUG)
     if not args.url:
         url = pick_a_pool_member(s_pool)
+        total_amount = current_amount(url + '.scan.list')
+        logger.info("There are %d files in %s", total_amount, url)
     else:
         url = args.url
+    if urlparse(url).path != '/' and (args.purge or args.db):
+        logger.warning("--db or --purge only support in root path mode")
+        exit()
     if not url:
         logger.info("No servers are reachable, please check your Internet connection...")
         exit()
-    database = "file.db"
     semaphore = asyncio.Semaphore(args.count)
     db_session = None
-    if args.db:
+    if args.db or args.purge:
         assert sys.version_info >= (3, 12), "DB function requires Python 3.12+."
-        db_session = await aiosqlite.connect(database)
-        await db_session.execute('''CREATE TABLE IF NOT EXISTS files
-                         (url TEXT PRIMARY KEY, filename TEXT, timestamp INTEGER, filesize INTERGER)''')
+        localdb = os.path.join(media, ".localfiles.db")
+        tempdb = os.path.join(media, ".tempfiles.db")
+        if not os.path.exists(localdb):
+            await generate_localdb(localdb, media)
+        db_session = await aiosqlite.connect(tempdb)
+        await create_table(db_session)
     async with ClientSession(connector=TCPConnector(ssl=False, limit=0, ttl_dns_cache=600)) as session:
-        await bulk_crawl_and_write(url=url, session=session, db_session=db_session, semaphore=semaphore, media=args.media, nfo=args.nfo)
+        await bulk_crawl_and_write(url=url, session=session, db_session=db_session, semaphore=semaphore, media=media,
+                                   nfo=args.nfo)
     if db_session:
         await db_session.commit()
         await db_session.close()
-    
+    if args.purge:
+        await purge_removed_files(localdb, tempdb, media, total_amount)
+        os.remove(localdb)
+        os.rename(tempdb, localdb)
+
 
 if __name__ == "__main__":
     assert sys.version_info >= (3, 10), "Script requires Python 3.10+."
