@@ -2,6 +2,7 @@
 # 小雅同步元数据
 
 高速异步爬虫从 https://emby.xiaoya.pro/ 同步小雅元数据
+
 该版本修改了fetch_html、download函数，generate_localdb函数添加windows系统判断，exam_file函数添加了.replace('\\', '/')
 
 ---
