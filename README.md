@@ -3,7 +3,7 @@
 
 高速异步爬虫从 https://emby.xiaoya.pro/ 同步小雅元数据
 
-该版本修改了fetch_html、download函数，generate_localdb函数添加windows系统判断，exam_file函数添加了.replace('\\\\', '/')
+修改了fetch_html、download、generate_localdb、exam_file函数
 
 ---
 
@@ -18,18 +18,11 @@ Save it into /etc/profile.d/ to make it global avaiable after reboot
 ulimit -n 4096
 ```
 ---
-## Installation
-
-#### Clone the project
-
-```bash
-  git clone https://github.com/Rik-F5/xiaoya_db
-```
-
+## 安装
 #### 跳转到项目文件夹
 
 ```bash
-  cd xiaoya_db
+  cd xiaoya_db_windows
 ```
 
 #### 选择环境
