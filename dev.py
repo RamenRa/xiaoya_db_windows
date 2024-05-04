@@ -319,8 +319,6 @@ async def compare_databases(localdb, tempdb, total_amount):
 
 async def purge_removed_files(localdb, tempdb, media, total_amount):
     for file in await compare_databases(localdb, tempdb, total_amount):
-        if "%7c" in file:
-            file = file.replace('%7c', '|')
         logger.info("Purged %s", file)
         os.remove(media + file)
 
