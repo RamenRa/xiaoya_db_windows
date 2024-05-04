@@ -75,7 +75,10 @@ def current_amount(url):
             hidden_pattern = r'^.*?\/\..*$'
             matching_lines = 0
             for line in response:
-                line = line.decode().strip()
+                try:
+                    line = line.decode(encoding='utf-8').strip()
+                except:
+                    logger.error("Error decoding line: %s", line)
                 match = re.match(pattern, line)
                 if match:
                     file = match.group(1)
@@ -98,18 +101,17 @@ async def fetch_html(url, session, **kwargs) -> str:
     async def _fetch_with_retry(session, url, retries_left):
         try:
             resp = await session.request(method="GET", url=url)
-            resp.raise_for_status()  # 这会抛出异常，如果状态码是 4xx 或 5xx
+            resp.raise_for_status()
             return await resp.text()
         except aiohttp.ClientError as e:
             if retries_left > 0:
-                # 等待一段时间后再重试，避免立即重试导致的服务器压力
+                # 等待一段时间后再重试
                 await asyncio.sleep(delay)  # 例如，等待1秒
                 return await _fetch_with_retry(session, url, retries_left - 1)
             else:
-                # 所有重试都失败了，记录错误并返回
                 logger.error("Failed to fetch HTML for URL: %s after %d retries, Error: %s",
                              unquote(url), retries, e)
-                return ""  # 或者抛出异常，或者返回一个错误消息
+                return ""
 
     async with semaphore:
         html = await _fetch_with_retry(session, url, retries)
@@ -191,9 +193,9 @@ async def download(file, session, **kwargs):
                 response = await session.get(url)
                 if response.status == 200:
                     file_path = os.path.join(kwargs['media'], filename.lstrip('/'))
-                    modified_path = file_path.replace('\\', '/')
+                    modified_path = file_path
                     if os.name == 'nt':
-                        modified_path = modified_path.replace('|', '%7c')
+                        modified_path = modified_path.replace('|', '%7c').replace('\\', '/')
                     os.umask(0)
                     os.makedirs(os.path.dirname(modified_path), mode=0o777, exist_ok=True)
                     async with aiofiles.open(modified_path, 'wb') as f:
@@ -202,16 +204,13 @@ async def download(file, session, **kwargs):
                         logger.debug("Finish to write file: %s", filename)
                     os.chmod(modified_path, 0o777)
                     logger.info("Downloaded: %s", filename)
-                    return  # 成功下载后退出重试循环
+                    return
                 else:
                     logger.info("Failed to download: %s [Response code: %s]", filename, response.status)
             except aiohttp.ClientError as e:
-                # re_download += 1
                 logger.warning("Download failed with exception: %s. Retrying...", e)
                 await asyncio.sleep(delay)  # 等待一段时间后再重试
-
-        # 如果重试完所有次数后仍然失败，则打印最终错误信息
-        logger.error("Failed to download after %d retries: %s", 3, filename)
+        logger.error("Failed to download after %d retries: %s", delay, filename)
         # download_error_list.append(filename)
 
 
@@ -241,7 +240,10 @@ async def insert_files(conn, items):
 
 async def exam_file(file, media):
     stat = await aio_os.stat(file)
-    return file[len(media):].replace('\\', '/'), int(stat.st_mtime), stat.st_size
+    filename = file[len(media):].replace('\\', '/')
+    if "%7c" in filename:
+        filename = filename.replace('%7c', '|')
+    return filename, int(stat.st_mtime), stat.st_size
 
 async def process_folder(conn, folder, media):
     for root, _, files in os.walk(folder):
@@ -257,8 +259,8 @@ async def generate_localdb(db, media):
         await create_table(conn)
         for path in s_paths:
             logger.info("Processing %s", unquote(os.path.join(media, path)))
-            await process_folder(conn, unquote(os.path.join(media, path)), media)   # 扫描本地文件
-        if os.name != 'nt':  # 不加这个windows上 第一次生成.localfiles.db 运行会报错
+            await process_folder(conn, unquote(os.path.join(media, path)), media)
+        if os.name != 'nt':
             await conn.close()
 
 
@@ -278,8 +280,6 @@ async def write_one(url, session, db_session, **kwargs) -> list:
         items = []
         for file in files:
             items.append(file[1:])
-        # await db_session.executemany('INSERT OR REPLACE INTO files VALUES (?, ?, ?)', items)
-        # await db_session.commit()
         await insert_files(db_session, items)
         logger.debug("Wrote results for source URL: %s", unquote(url))
     return directories
@@ -319,6 +319,8 @@ async def compare_databases(localdb, tempdb, total_amount):
 
 async def purge_removed_files(localdb, tempdb, media, total_amount):
     for file in await compare_databases(localdb, tempdb, total_amount):
+        if "%7c" in file:
+            file = file.replace('%7c', '|')
         logger.info("Purged %s", file)
         os.remove(media + file)
 
@@ -345,8 +347,6 @@ async def main():
         logging.getLogger("areq").setLevel(logging.DEBUG)
     if not args.url:
         url = pick_a_pool_member(s_pool)
-        total_amount = current_amount(url + '.scan.list')
-        logger.info("There are %d files in %s", total_amount, url)
     else:
         url = args.url
     if urlparse(url).path != '/' and (args.purge or args.db):
@@ -355,6 +355,9 @@ async def main():
     if not url:
         logger.info("No servers are reachable, please check your Internet connection...")
         exit()
+    if urlparse(url).path == '/':
+        total_amount = current_amount(url + '.scan.list')
+        logger.info("There are %d files in %s", total_amount, url)
     semaphore = asyncio.Semaphore(args.count)
     db_session = None
     if args.db or args.purge:
